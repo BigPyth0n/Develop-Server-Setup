@@ -138,7 +138,7 @@ install_python_selected() {
 }
 
 ########################################
-# 3) PostgreSQL (PGDG latest major, local-only) — with robust SQL init
+# 3) PostgreSQL (PGDG latest major, local-only) — FIXED with \gexec & scram
 ########################################
 install_postgresql_local() {
   log "Adding official PostgreSQL (PGDG) repo & installing latest major..."
@@ -147,11 +147,9 @@ install_postgresql_local() {
   . /etc/os-release
   echo "deb [signed-by=/usr/share/keyrings/postgresql-keyring.gpg] http://apt.postgresql.org/pub/repos/apt ${UBUNTU_CODENAME}-pgdg main" > /etc/apt/sources.list.d/pgdg.list
   apt-get update -qq
-
-  # نصب متاپکیج (آخرین major) + ابزارها
   apt-get install -y postgresql postgresql-contrib -qq
 
-  # تشخیص نسخهٔ ماژور فعال
+  # Detect major
   local PG_MAJ=""
   if command -v pg_lsclusters >/dev/null 2>&1; then
     PG_MAJ="$(pg_lsclusters -h | awk 'NR==1{print $1}')"
@@ -167,7 +165,7 @@ install_postgresql_local() {
   local PG_HBA_CONF="${CONF_DIR}/pg_hba.conf"
   [[ -d "$CONF_DIR" ]] || { err "Config dir not found: $CONF_DIR"; command -v pg_lsclusters >/dev/null 2>&1 && pg_lsclusters || true; exit 1; }
 
-  # محدود به لوکال + پورت
+  # Bind to localhost & set port
   if grep -qE '^\s*#?\s*listen_addresses' "$POSTGRESQL_CONF"; then
     sed -i "s/^#\?listen_addresses.*/listen_addresses = '127.0.0.1'/" "$POSTGRESQL_CONF"
   else
@@ -179,17 +177,17 @@ install_postgresql_local() {
     echo "port = ${POSTGRES_PORT}" >> "$POSTGRESQL_CONF"
   fi
 
-  # اجازهٔ لوکال با md5
-  if ! grep -qE '^\s*host\s+all\s+all\s+127\.0\.0\.1/32\s+md5' "$PG_HBA_CONF"; then
-    echo "host    all             all             127.0.0.1/32            md5" >> "$PG_HBA_CONF"
+  # Ensure local scram-sha-256 rule (ترجیحاً امن‌تر از md5)
+  if ! grep -qE '^\s*host\s+all\s+all\s+127\.0\.0\.1/32\s+scram-sha-256' "$PG_HBA_CONF"; then
+    echo "host    all             all             127.0.0.1/32            scram-sha-256" >> "$PG_HBA_CONF"
   fi
 
   systemctl enable --now postgresql
 
-  # ساخت Role/DBها — بدون هیچ expand در شِل ($$ امن می‌ماند)، و بدون هشدار تغییر دایرکتوری
+  # Create roles & DBs safely using \gexec (NO DO $$, NO variable/$$ issues)
   (
     cd /var/lib/postgresql || cd /
-    sudo -H -u postgres psql -v ON_ERROR_STOP=1 \
+    sudo -H -u postgres psql --set=ON_ERROR_STOP=1 \
       --set=usr="${POSTGRES_USER}" \
       --set=pw="${POSTGRES_PASSWORD}" \
       --set=db="${POSTGRES_DB}" \
@@ -197,35 +195,25 @@ install_postgresql_local() {
       --set=mbpw="${MB_DB_PASSWORD}" \
       --set=mbdb="${MB_DB_NAME}" \
       --file - <<'PSQL'
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'usr') THEN
-    EXECUTE 'CREATE ROLE ' || quote_ident(:'usr') || ' LOGIN PASSWORD ' || quote_literal(:'pw');
-  END IF;
-END $$;
+-- App role
+SELECT format('CREATE ROLE %I LOGIN PASSWORD %L', :'usr', :'pw')
+WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'usr') \gexec
 
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'db') THEN
-    EXECUTE 'CREATE DATABASE ' || quote_ident(:'db') || ' OWNER ' || quote_ident(:'usr');
-  END IF;
-END $$;
+-- App DB
+SELECT format('CREATE DATABASE %I OWNER %I', :'db', :'usr')
+WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'db') \gexec
 
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'mbusr') THEN
-    EXECUTE 'CREATE ROLE ' || quote_ident(:'mbusr') || ' LOGIN PASSWORD ' || quote_literal(:'mbpw');
-  END IF;
-END $$;
+-- Metabase role
+SELECT format('CREATE ROLE %I LOGIN PASSWORD %L', :'mbusr', :'mbpw')
+WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'mbusr') \gexec
 
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'mbdb') THEN
-    EXECUTE 'CREATE DATABASE ' || quote_ident(:'mbdb') || ' OWNER ' || quote_ident(:'mbusr');
-  END IF;
-END $$;
+-- Metabase DB
+SELECT format('CREATE DATABASE %I OWNER %I', :'mbdb', :'mbusr')
+WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'mbdb') \gexec
 PSQL
   )
 
-  systemctl restart postgresql
-
-  # تمیزکاری اختیاری: اگر شاخه‌های قدیمی هم‌زمان نصب شدند، پاکشان کن
+  # Optional cleanup: purge older majors if present
   if command -v pg_lsclusters >/dev/null 2>&1; then
     while read -r v rest; do
       if [[ "$v" != "$PG_MAJ" ]]; then
@@ -236,6 +224,7 @@ PSQL
     done < <(pg_lsclusters -h | awk '{print $1" "$0}')
   fi
 
+  systemctl restart postgresql
   ok "PostgreSQL (PGDG $PG_MAJ) bound to 127.0.0.1:${POSTGRES_PORT} (conf: $CONF_DIR)."
 }
 
@@ -259,7 +248,6 @@ CSRF_COOKIE_SECURE = True
 ENHANCED_COOKIE_PROTECTION = True
 EOF
 
-  # اگر این اسکریپت وجود داشت، در حالت سرور پیکربندی‌اش کن (غیرتعاملی)
   if [[ -x /usr/pgadmin4/bin/setup-web.sh ]]; then
     /usr/pgadmin4/bin/setup-web.sh --yes --mode server || true
   fi
@@ -342,6 +330,7 @@ TIMEZONE=${TIMEZONE}
 MB_DB_NAME=${MB_DB_NAME}
 MB_DB_USER=${MB_DB_USER}
 MB_DB_PASSWORD=${MB_DB_PASSWORD}
+PG_PORT=${POSTGRES_PORT}
 EOF
 
   cat > /opt/stack/docker-compose.yml <<'YAML'
@@ -350,7 +339,7 @@ services:
   # Gateway از کانتینرها به Postgres لوکال روی هاست (بدون اکسپوز 5432 به اینترنت)
   pg-gateway:
     image: alpine/socat:latest
-    command: ["tcp-listen:5432,fork,reuseaddr","tcp-connect:host.docker.internal:5432"]
+    command: ["tcp-listen:5432,fork,reuseaddr","tcp-connect:host.docker.internal:${PG_PORT}"]
     restart: unless-stopped
     networks: [ backend ]
     extra_hosts:
@@ -428,11 +417,11 @@ print_summary() {
 
 - Metabase (پشت NPM منتشر کن)
   - Metadata DB → ${MB_DB_NAME} (owner: ${MB_DB_USER})
-  - اتصال به Postgres از طریق pg-gateway (بدون اکسپوز 5432)
+  - اتصال به Postgres از طریق pg-gateway (بدون اکسپوز 5432) روی پورت هاست ${POSTGRES_PORT}
 
 - pgAdmin (لوکال، پشت NPM منتشر کن)
   - Bind: 127.0.0.1:${PGADMIN_PORT}
-  - First login (از UI): ${PGADMIN_EMAIL} / ${PGADMIN_PASSWORD}
+  - First login: از UI یک اکانت با ایمیل/پسوردی که دادی بساز
 
 - code-server (لوکال)
   - URL:  http://127.0.0.1:${CODE_SERVER_PORT}
