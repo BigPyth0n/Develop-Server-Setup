@@ -59,7 +59,8 @@
 # Linux/macOS
 ```bash
 
-URL='https://raw.githubusercontent.com/BigPyth0n/Develop-Server-Setup/refs/heads/main/setup_server.sh'; TS="$(date +%s)"; curl -fsSL "${URL}?nocache=${TS}" -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' -H 'If-None-Match:' -o setup_server.sh
+bash <(curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' -H 'If-None-Match:' "https://raw.githubusercontent.com/BigPyth0n/Develop-Server-Setup/refs/heads/main/setup_server.sh?nocache=$(date +%s)")
+
 
 ```
 
