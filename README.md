@@ -56,28 +56,13 @@
 ## دانلود (بدون استفاده از کش گیت‌هاب)
 
 برای جلوگیری از کشِ CDN، از یک پارامتر تصادفی و هدرهای ضدکش استفاده کنید:
-
-```bash
 # Linux/macOS
-URL='https://raw.githubusercontent.com/BigPyth0n/Develop-Server-Setup/refs/heads/main/setup_server.sh'
-TS="$(date +%s)"
-curl -fsSL "${URL}?nocache=${TS}" \
-  -H 'Cache-Control: no-cache' \
-  -H 'Pragma: no-cache' \
-  -H 'If-None-Match:' \
-  -o setup_server.sh
+```bash
+
+URL='https://raw.githubusercontent.com/BigPyth0n/Develop-Server-Setup/refs/heads/main/setup_server.sh'; TS="$(date +%s)"; curl -fsSL "${URL}?nocache=${TS}" -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' -H 'If-None-Match:' -o setup_server.sh
+
 ```
 
-```powershell
-# Windows PowerShell
-$URL = 'https://raw.githubusercontent.com/BigPyth0n/Develop-Server-Setup/refs/heads/main/setup_server.sh'
-$TS  = [int][double]::Parse((Get-Date -UFormat %s))
-curl "$URL?nocache=$TS" `
-  -H 'Cache-Control: no-cache' `
-  -H 'Pragma: no-cache' `
-  -H 'If-None-Match:' `
-  -o setup_server.sh
-```
 
 > اگر `curl` در ویندوز موجود نیست، از WSL/Git Bash استفاده کنید یا `Invoke-WebRequest` با هدرهای مشابه به‌کار ببرید.
 
