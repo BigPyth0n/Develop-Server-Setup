@@ -58,14 +58,9 @@
 برای جلوگیری از کشِ CDN، از یک پارامتر تصادفی و هدرهای ضدکش استفاده کنید:
 # Linux/macOS
 ```bash
-
 bash <(curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' -H 'If-None-Match:' "https://raw.githubusercontent.com/BigPyth0n/Develop-Server-Setup/refs/heads/main/setup_server.sh?nocache=$(date +%s)")
-
-
 ```
 
-
-> اگر `curl` در ویندوز موجود نیست، از WSL/Git Bash استفاده کنید یا `Invoke-WebRequest` با هدرهای مشابه به‌کار ببرید.
 
 ---
 
