@@ -152,13 +152,13 @@ install_postgresql_local() {
   apt-get update -qq
   apt-get install -y postgresql postgresql-contrib -qq
 
-  # Detect major
+  # تشخیص نسخهٔ ماژور
   local PG_MAJ=""
   if command -v pg_lsclusters >/dev/null 2>&1; then
     PG_MAJ="$(pg_lsclusters -h | awk 'NR==1{print $1}')"
   fi
   if [[ -z "${PG_MAJ:-}" ]]; then
-    local PG_VER_STR; PG_VER_STR="$(psql -V | awk '{print $3}')" # e.g. 17.3
+    local PG_VER_STR; PG_VER_STR="$(psql -V | awk '{print $3}')"
     PG_MAJ="${PG_VER_STR%%.*}"
   fi
   [[ -z "$PG_MAJ" ]] && PG_MAJ="17"
@@ -166,37 +166,49 @@ install_postgresql_local() {
   local CONF_DIR="/etc/postgresql/${PG_MAJ}/main"
   local POSTGRESQL_CONF="${CONF_DIR}/postgresql.conf"
   local PG_HBA_CONF="${CONF_DIR}/pg_hba.conf"
+  [[ -d "$CONF_DIR" ]] || { err "Config dir not found: $CONF_DIR"; command -v pg_lsclusters >/dev/null 2>&1 && pg_lsclusters || true; exit 1; }
 
-  [[ -d "$CONF_DIR" ]] || { err "PostgreSQL cluster directory not found: $CONF_DIR"; command -v pg_lsclusters >/dev/null 2>&1 && pg_lsclusters || true; exit 1; }
+  # محدود به لوکال + پورت
+  grep -qE '^\s*listen_addresses' "$POSTGRESQL_CONF" \
+    && sed -i "s/^#\?listen_addresses.*/listen_addresses = '127.0.0.1'/" "$POSTGRESQL_CONF" \
+    || echo "listen_addresses = '127.0.0.1'" >> "$POSTGRESQL_CONF"
 
-  # Bind to localhost & set port (append if missing)
-  if grep -qE '^\s*#?\s*listen_addresses' "$POSTGRESQL_CONF"; then
-    sed -i "s/^#\?listen_addresses.*/listen_addresses = '127.0.0.1'/" "$POSTGRESQL_CONF"
-  else
-    echo "listen_addresses = '127.0.0.1'" >> "$POSTGRESQL_CONF"
-  fi
-  if grep -qE '^\s*#?\s*port\s*=' "$POSTGRESQL_CONF"; then
-    sed -i "s/^#\?port.*/port = ${POSTGRES_PORT}/" "$POSTGRESQL_CONF"
-  else
-    echo "port = ${POSTGRES_PORT}" >> "$POSTGRESQL_CONF"
-  fi
+  grep -qE '^\s*port\s*=' "$POSTGRESQL_CONF" \
+    && sed -i "s/^#\?port.*/port = ${POSTGRES_PORT}/" "$POSTGRESQL_CONF" \
+    || echo "port = ${POSTGRES_PORT}" >> "$POSTGRESQL_CONF"
 
-  # Ensure local md5 rule
-  if ! grep -qE '^\s*host\s+all\s+all\s+127\.0\.0\.1/32\s+md5' "$PG_HBA_CONF"; then
+  grep -qE '^\s*host\s+all\s+all\s+127\.0\.0\.1/32\s+md5' "$PG_HBA_CONF" || \
     echo "host    all             all             127.0.0.1/32            md5" >> "$PG_HBA_CONF"
-  fi
 
   systemctl enable --now postgresql
 
-  # Create role (quoted; preserves case) if not exists
-  sudo -H -u postgres bash -lc "psql -v ON_ERROR_STOP=1 --set=usr='${POSTGRES_USER}' --set=pw='${POSTGRES_PASSWORD}' -c \"DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'usr') THEN EXECUTE 'CREATE ROLE ' || quote_ident(:'usr') || ' LOGIN PASSWORD ' || quote_literal(:'pw'); END IF; END \$\$;\""
+  # ساخت امن رول و دیتابیس‌ها با heredoc quote‌شده (از expand شِل جلوگیری می‌کند)
+  sudo -H -u postgres bash -lc \
+"psql -v ON_ERROR_STOP=1 --set=usr='${POSTGRES_USER}' --set=pw='${POSTGRES_PASSWORD}' --set=db='${POSTGRES_DB}' --set=mbusr='${MB_DB_USER}' --set=mbdb='${MB_DB_NAME}' <<'PSQL'
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'usr') THEN
+    EXECUTE 'CREATE ROLE ' || quote_ident(:'usr') || ' LOGIN PASSWORD ' || quote_literal(:'pw');
+  END IF;
+END $$;
 
-  # Create DB (quoted) if not exists, owned by user
-  sudo -H -u postgres bash -lc "psql -v ON_ERROR_STOP=1 --set=db='${POSTGRES_DB}' --set=usr='${POSTGRES_USER}' -c \"DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'db') THEN EXECUTE 'CREATE DATABASE ' || quote_ident(:'db') || ' OWNER ' || quote_ident(:'usr'); END IF; END \$\$;\""
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'db') THEN
+    EXECUTE 'CREATE DATABASE ' || quote_ident(:'db') || ' OWNER ' || quote_ident(:'usr');
+  END IF;
+END $$;
 
-  # Metabase role/db
-  sudo -H -u postgres bash -lc "psql -v ON_ERROR_STOP=1 --set=usr='${MB_DB_USER}' --set=pw='${MB_DB_PASSWORD}' -c \"DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'usr') THEN EXECUTE 'CREATE ROLE ' || quote_ident(:'usr') || ' LOGIN PASSWORD ' || quote_literal(:'pw'); END IF; END \$\$;\""
-  sudo -H -u postgres bash -lc "psql -v ON_ERROR_STOP=1 --set=db='${MB_DB_NAME}' --set=usr='${MB_DB_USER}' -c \"DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'db') THEN EXECUTE 'CREATE DATABASE ' || quote_ident(:'db') || ' OWNER ' || quote_ident(:'usr'); END IF; END \$\$;\""
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'mbusr') THEN
+    EXECUTE 'CREATE ROLE ' || quote_ident(:'mbusr') || ' LOGIN PASSWORD ' || quote_literal(:'pw');
+  END IF;
+END $$;
+
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'mbdb') THEN
+    EXECUTE 'CREATE DATABASE ' || quote_ident(:'mbdb') || ' OWNER ' || quote_ident(:'mbusr');
+  END IF;
+END $$;
+PSQL"
 
   systemctl restart postgresql
   ok "PostgreSQL (PGDG) bound to 127.0.0.1:${POSTGRES_PORT} (conf: $CONF_DIR)."
