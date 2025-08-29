@@ -7,7 +7,6 @@ set -euo pipefail
 log() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
 ok()  { echo -e "\033[1;32m[DONE]\033[0m $*"; }
 err() { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
-
 need_root(){ [[ $EUID -eq 0 ]] || { err "Run as root (sudo)."; exit 1; }; }
 
 prompt_value() { # $1=question  $2=default -> echo result
@@ -46,6 +45,8 @@ write_summary() { # $1=text
   echo "📄 خلاصهٔ نصب در: $f (فقط root دسترسی دارد)"
 }
 
+trap 'err "نصب با خطا متوقف شد (exit code $?). آخرین پیام‌های بالا را بررسی کن."' ERR
+
 ########################################
 #      0) Collect interactive inputs
 ########################################
@@ -74,7 +75,6 @@ gather_inputs() {
   CODE_SERVER_PORT=$(prompt_value "پورت code-server (لوکال)" "8443")
   CODE_SERVER_PASSWORD=$(prompt_secret "پسورد ورود code-server")
 
-  # NPM/Portainer are public on standard ports; domains are configured later in NPM UI.
   echo
   echo "✅ ورودی‌ها دریافت شد."
 }
@@ -114,35 +114,58 @@ install_python_311() {
 }
 
 ########################################
-#      2) PostgreSQL (local-only)
+#      2) PostgreSQL (local-only)  ★ FIXED
 ########################################
 install_postgresql_local() {
   log "Installing PostgreSQL (local-only)..."
   apt-get install -y postgresql postgresql-contrib -qq
-  PG_VER="$(psql -V | awk '{print $3}' | cut -d. -f1,2 || true)"
-  [[ -z "$PG_VER" ]] && PG_VER="14"
-  local CONF_DIR="/etc/postgresql/${PG_VER}/main"
 
-  sed -i "s/^#\?listen_addresses.*/listen_addresses = '127.0.0.1'/" "${CONF_DIR}/postgresql.conf" || true
-  sed -i "s/^#\?port.*/port = ${POSTGRES_PORT}/" "${CONF_DIR}/postgresql.conf" || true
-  if ! grep -q "127.0.0.1/32" "${CONF_DIR}/pg_hba.conf"; then
-    echo "host    all             all             127.0.0.1/32            md5" >> "${CONF_DIR}/pg_hba.conf"
+  # === Detect major version & config dir robustly ===
+  local PG_MAJ=""
+  if command -v pg_lsclusters >/dev/null 2>&1; then
+    PG_MAJ="$(pg_lsclusters -h | awk 'NR==1{print $1}')"
+  fi
+  if [[ -z "${PG_MAJ:-}" ]]; then
+    local PG_VER_STR
+    PG_VER_STR="$(psql -V | awk '{print $3}')"    # e.g. 14.18
+    PG_MAJ="${PG_VER_STR%%.*}"                    # -> 14
+  fi
+  [[ -z "${PG_MAJ}" ]] && PG_MAJ="14"
+
+  local CONF_DIR="/etc/postgresql/${PG_MAJ}/main"
+  local POSTGRESQL_CONF="${CONF_DIR}/postgresql.conf"
+  local PG_HBA_CONF="${CONF_DIR}/pg_hba.conf"
+
+  if [[ ! -d "$CONF_DIR" ]]; then
+    err "PostgreSQL cluster directory not found: $CONF_DIR"
+    command -v pg_lsclusters >/dev/null 2>&1 && pg_lsclusters || true
+    exit 1
+  fi
+
+  # Bind to localhost & set port
+  sed -i "s/^#\?listen_addresses.*/listen_addresses = '127.0.0.1'/" "$POSTGRESQL_CONF"
+  sed -i "s/^#\?port.*/port = ${POSTGRES_PORT}/" "$POSTGRESQL_CONF"
+
+  # Ensure local md5 rule
+  if ! grep -qE '^\s*host\s+all\s+all\s+127\.0\.0\.1/32\s+md5' "$PG_HBA_CONF"; then
+    echo "host    all             all             127.0.0.1/32            md5" >> "$PG_HBA_CONF"
   fi
 
   systemctl enable --now postgresql
 
+  # Create/ensure users & DBs
   sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${POSTGRES_USER}'" | grep -q 1 \
     || sudo -u postgres psql -c "CREATE ROLE ${POSTGRES_USER} LOGIN PASSWORD '${POSTGRES_PASSWORD}';"
   sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='${POSTGRES_DB}'" | grep -q 1 \
     || sudo -u postgres createdb -O "${POSTGRES_USER}" "${POSTGRES_DB}"
 
-  # Metabase metadata DB/user
   sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${MB_DB_USER}'" | grep -q 1 \
     || sudo -u postgres psql -c "CREATE ROLE ${MB_DB_USER} LOGIN PASSWORD '${MB_DB_PASSWORD}';"
   sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='${MB_DB_NAME}'" | grep -q 1 \
     || sudo -u postgres createdb -O "${MB_DB_USER}" "${MB_DB_NAME}"
 
-  ok "PostgreSQL bound to 127.0.0.1:${POSTGRES_PORT}."
+  systemctl restart postgresql
+  ok "PostgreSQL bound to 127.0.0.1:${POSTGRES_PORT} (conf: $CONF_DIR)."
 }
 
 ########################################
@@ -166,13 +189,13 @@ CSRF_COOKIE_SECURE = True
 ENHANCED_COOKIE_PROTECTION = True
 EOF
 
-  # راه‌اندازی سرویس وب pgAdmin
+  # آماده‌سازی حالت سرور (بدون Apache روی 80)
   if [[ -x /usr/pgadmin4/bin/setup-web.sh ]]; then
     /usr/pgadmin4/bin/setup-web.sh --yes --mode server
   fi
   systemctl enable --now pgadmin4 || systemctl restart pgadmin4
   ok "pgAdmin is listening on 127.0.0.1:${PGADMIN_PORT}"
-  echo "یادداشت: در اولین ورود به UI، یک حساب با ایمیل/پسوردی که همین‌جا وارد کردی بساز."
+  echo "یادداشت: در اولین ورود به UI، یک حساب با ایمیل/پسوردی که همین‌جا وارد کردی بساز (اگر لازم شد)."
 }
 
 ########################################
@@ -235,7 +258,7 @@ configure_ufw() {
   ufw allow 443/tcp
   ufw allow 81/tcp     # NPM Admin
   ufw allow 9443/tcp   # Portainer
-  # 5432 و 5050 عمداً باز نیستند (لوکال/پشت NPM)
+  # 5432 و 5050 و 8443 عمداً باز نیستند (لوکال/پشت NPM)
   ufw --force enable
   ok "UFW configured."
 }
@@ -256,6 +279,7 @@ EOF
   cat > /opt/stack/docker-compose.yml <<'YAML'
 name: webstack
 services:
+  # پل شبکه‌ای از کانتینرها به Postgres لوکال روی هاست (بدون اکسپوز اینترنتی 5432)
   pg-gateway:
     image: alpine/socat:latest
     command: ["tcp-listen:5432,fork,reuseaddr","tcp-connect:host.docker.internal:5432"]
