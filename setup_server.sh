@@ -49,8 +49,8 @@ gather_inputs() {
 
   TIMEZONE=$(prompt_value "Timezone" "Etc/UTC")
 
-  # Python version selector
-  PY_VERSION=$(prompt_value "نسخه Python (3.10 سازگار/پایدار، یا 3.11/3.12/3.13)" "3.10")
+  # Python version selector (default 3.10)
+  PY_VERSION=$(prompt_value "نسخه Python (3.10 پایدار، یا 3.11/3.12/3.13)" "3.10")
 
   # PostgreSQL (local)
   POSTGRES_PORT=$(prompt_value "پورت PostgreSQL (لوکال)" "5432")
@@ -95,7 +95,7 @@ install_basics() {
 }
 
 ensure_hostname_mapping() {
-  # جلوگیری از خطای: sudo: unable to resolve host <hostname>
+  # فیکس خطای: sudo: unable to resolve host <hostname>
   local hn; hn="$(hostname)"
   if ! grep -Eq "127\.0\.1\.1\s+.*\b${hn}\b" /etc/hosts; then
     log "Fixing /etc/hosts mapping for hostname: $hn"
@@ -111,7 +111,6 @@ install_python_selected() {
   log "Installing Python ${PY_VERSION}..."
   case "$PY_VERSION" in
     3.10)
-      # پایدارترین با Ubuntu 22.04 (سیستمی)
       apt-get install -y python3 python3-venv python3-dev python3-distutils python3-pip -qq
       update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3 1 || true
       update-alternatives --install /usr/bin/pip3 pip3 /usr/bin/pip3 1 || true
@@ -120,11 +119,9 @@ install_python_selected() {
       add-apt-repository -y ppa:deadsnakes/ppa >/dev/null
       apt-get update -qq
       apt-get install -y "python${PY_VERSION}" "python${PY_VERSION}-venv" "python${PY_VERSION}-dev" "python${PY_VERSION}-distutils" -qq
-      # pip
       if ! command -v "pip${PY_VERSION}" >/dev/null 2>&1; then
         "/usr/bin/python${PY_VERSION}" -m ensurepip --upgrade || true
       fi
-      # set as default
       update-alternatives --install /usr/bin/python3 python3 "/usr/bin/python${PY_VERSION}" 1
       if command -v "pip${PY_VERSION}" >/dev/null 2>&1; then
         ln -sf "$(command -v "pip${PY_VERSION}")" /usr/bin/pip3 || true
@@ -141,7 +138,7 @@ install_python_selected() {
 }
 
 ########################################
-# 3) PostgreSQL (PGDG latest major, local-only)
+# 3) PostgreSQL (PGDG latest major, local-only) — with robust SQL init
 ########################################
 install_postgresql_local() {
   log "Adding official PostgreSQL (PGDG) repo & installing latest major..."
@@ -150,15 +147,17 @@ install_postgresql_local() {
   . /etc/os-release
   echo "deb [signed-by=/usr/share/keyrings/postgresql-keyring.gpg] http://apt.postgresql.org/pub/repos/apt ${UBUNTU_CODENAME}-pgdg main" > /etc/apt/sources.list.d/pgdg.list
   apt-get update -qq
+
+  # نصب متاپکیج (آخرین major) + ابزارها
   apt-get install -y postgresql postgresql-contrib -qq
 
-  # Detect major
+  # تشخیص نسخهٔ ماژور فعال
   local PG_MAJ=""
   if command -v pg_lsclusters >/dev/null 2>&1; then
     PG_MAJ="$(pg_lsclusters -h | awk 'NR==1{print $1}')"
   fi
   if [[ -z "${PG_MAJ:-}" ]]; then
-    local PG_VER_STR; PG_VER_STR="$(psql -V | awk '{print $3}')" # e.g. 17.6
+    local PG_VER_STR; PG_VER_STR="$(psql -V | awk '{print $3}')"
     PG_MAJ="${PG_VER_STR%%.*}"
   fi
   [[ -z "$PG_MAJ" ]] && PG_MAJ="17"
@@ -168,7 +167,7 @@ install_postgresql_local() {
   local PG_HBA_CONF="${CONF_DIR}/pg_hba.conf"
   [[ -d "$CONF_DIR" ]] || { err "Config dir not found: $CONF_DIR"; command -v pg_lsclusters >/dev/null 2>&1 && pg_lsclusters || true; exit 1; }
 
-  # Bind to localhost & set port (append if missing)
+  # محدود به لوکال + پورت
   if grep -qE '^\s*#?\s*listen_addresses' "$POSTGRESQL_CONF"; then
     sed -i "s/^#\?listen_addresses.*/listen_addresses = '127.0.0.1'/" "$POSTGRESQL_CONF"
   else
@@ -180,16 +179,24 @@ install_postgresql_local() {
     echo "port = ${POSTGRES_PORT}" >> "$POSTGRESQL_CONF"
   fi
 
-  # Ensure local md5 rule
+  # اجازهٔ لوکال با md5
   if ! grep -qE '^\s*host\s+all\s+all\s+127\.0\.0\.1/32\s+md5' "$PG_HBA_CONF"; then
     echo "host    all             all             127.0.0.1/32            md5" >> "$PG_HBA_CONF"
   fi
 
   systemctl enable --now postgresql
 
-  # ساخت امن رول و دیتابیس‌ها با heredoc quote‌شده (جلوگیری از expand شِل روی $$)
-  sudo -H -u postgres bash -lc \
-"psql -v ON_ERROR_STOP=1 --set=usr='${POSTGRES_USER}' --set=pw='${POSTGRES_PASSWORD}' --set=db='${POSTGRES_DB}' --set=mbusr='${MB_DB_USER}' --set=mbdb='${MB_DB_NAME}' <<'PSQL'
+  # ساخت Role/DBها — بدون هیچ expand در شِل ($$ امن می‌ماند)، و بدون هشدار تغییر دایرکتوری
+  (
+    cd /var/lib/postgresql || cd /
+    sudo -H -u postgres psql -v ON_ERROR_STOP=1 \
+      --set=usr="${POSTGRES_USER}" \
+      --set=pw="${POSTGRES_PASSWORD}" \
+      --set=db="${POSTGRES_DB}" \
+      --set=mbusr="${MB_DB_USER}" \
+      --set=mbpw="${MB_DB_PASSWORD}" \
+      --set=mbdb="${MB_DB_NAME}" \
+      --file - <<'PSQL'
 DO $$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'usr') THEN
     EXECUTE 'CREATE ROLE ' || quote_ident(:'usr') || ' LOGIN PASSWORD ' || quote_literal(:'pw');
@@ -204,7 +211,7 @@ END $$;
 
 DO $$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'mbusr') THEN
-    EXECUTE 'CREATE ROLE ' || quote_ident(:'mbusr') || ' LOGIN PASSWORD ' || quote_literal(:'pw');
+    EXECUTE 'CREATE ROLE ' || quote_ident(:'mbusr') || ' LOGIN PASSWORD ' || quote_literal(:'mbpw');
   END IF;
 END $$;
 
@@ -213,10 +220,23 @@ DO $$ BEGIN
     EXECUTE 'CREATE DATABASE ' || quote_ident(:'mbdb') || ' OWNER ' || quote_ident(:'mbusr');
   END IF;
 END $$;
-PSQL"
+PSQL
+  )
 
   systemctl restart postgresql
-  ok "PostgreSQL (PGDG) bound to 127.0.0.1:${POSTGRES_PORT} (conf: $CONF_DIR)."
+
+  # تمیزکاری اختیاری: اگر شاخه‌های قدیمی هم‌زمان نصب شدند، پاکشان کن
+  if command -v pg_lsclusters >/dev/null 2>&1; then
+    while read -r v rest; do
+      if [[ "$v" != "$PG_MAJ" ]]; then
+        log "Removing older PostgreSQL major: $v"
+        pg_dropcluster --stop "$v" main || true
+        apt-get -y purge "postgresql-$v" "postgresql-contrib-$v" || true
+      fi
+    done < <(pg_lsclusters -h | awk '{print $1" "$0}')
+  fi
+
+  ok "PostgreSQL (PGDG $PG_MAJ) bound to 127.0.0.1:${POSTGRES_PORT} (conf: $CONF_DIR)."
 }
 
 ########################################
@@ -239,8 +259,9 @@ CSRF_COOKIE_SECURE = True
 ENHANCED_COOKIE_PROTECTION = True
 EOF
 
+  # اگر این اسکریپت وجود داشت، در حالت سرور پیکربندی‌اش کن (غیرتعاملی)
   if [[ -x /usr/pgadmin4/bin/setup-web.sh ]]; then
-    /usr/pgadmin4/bin/setup-web.sh --yes --mode server
+    /usr/pgadmin4/bin/setup-web.sh --yes --mode server || true
   fi
   systemctl enable --now pgadmin4 || systemctl restart pgadmin4
   ok "pgAdmin is listening on 127.0.0.1:${PGADMIN_PORT}"
@@ -305,7 +326,7 @@ configure_ufw() {
   ufw allow 443/tcp
   ufw allow 81/tcp     # NPM Admin
   ufw allow 9443/tcp   # Portainer
-  # 5432/5050/8443 لوکال هستند → نیازی به باز کردن نیست
+  # 5432/5050/8443 لوکال هستند
   ufw --force enable
   ok "UFW configured."
 }
@@ -400,7 +421,7 @@ print_summary() {
 
 [لوکال]
 - Python: ${PY_VERSION}
-- PostgreSQL (PGDG/latest): 127.0.0.1:${POSTGRES_PORT}
+- PostgreSQL (PGDG): 127.0.0.1:${POSTGRES_PORT}
   - User: ${POSTGRES_USER}
   - Password: ${POSTGRES_PASSWORD}
   - Default DB: ${POSTGRES_DB}
