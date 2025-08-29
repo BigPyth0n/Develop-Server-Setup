@@ -63,10 +63,9 @@ gather_inputs() {
   MB_DB_USER=$(prompt_value "یوزر دیتابیس متابیس" "metabase")
   MB_DB_PASSWORD=$(prompt_secret "پسورد دیتابیس متابیس")
 
-  # pgAdmin (local)
+  # pgAdmin (local web)
   PGADMIN_PORT=$(prompt_value "پورت pgAdmin (لوکال)" "5050")
-  PGADMIN_EMAIL=$(prompt_value "ایمیل ادمین pgAdmin" "admin@example.com")
-  PGADMIN_PASSWORD=$(prompt_secret "پسورد حساب pgAdmin (برای اولین ورود)")
+  PGADMIN_EMAIL=$(prompt_value "ایمیل ادمین pgAdmin (اولین ورود را خودت می‌سازی)" "admin@example.com")
 
   # code-server (local)
   CODE_SERVER_PORT=$(prompt_value "پورت code-server (لوکال)" "8443")
@@ -85,7 +84,7 @@ update_upgrade() {
   apt-get -y dist-upgrade -qq
   apt-get -y autoremove -qq
   timedatectl set-timezone "$TIMEZONE" || true
-  ok "System updated."
+  ok "System updated. (پیام‌های NEEDRESTART-* فقط اطلاع‌رسانی هستند)"
 }
 
 install_basics() {
@@ -95,7 +94,7 @@ install_basics() {
 }
 
 ensure_hostname_mapping() {
-  # فیکس خطای: sudo: unable to resolve host <hostname>
+  # فیکس: sudo: unable to resolve host <hostname>
   local hn; hn="$(hostname)"
   if ! grep -Eq "127\.0\.1\.1\s+.*\b${hn}\b" /etc/hosts; then
     log "Fixing /etc/hosts mapping for hostname: $hn"
@@ -138,7 +137,7 @@ install_python_selected() {
 }
 
 ########################################
-# 3) PostgreSQL (PGDG latest major, local-only) — FIXED with \gexec & scram
+# 3) PostgreSQL (PGDG latest major, local-only) — \gexec + scram
 ########################################
 install_postgresql_local() {
   log "Adding official PostgreSQL (PGDG) repo & installing latest major..."
@@ -177,7 +176,7 @@ install_postgresql_local() {
     echo "port = ${POSTGRES_PORT}" >> "$POSTGRESQL_CONF"
   fi
 
-  # Ensure local scram-sha-256 rule (ترجیحاً امن‌تر از md5)
+  # Local scram-sha-256 (امن‌تر از md5)
   if ! grep -qE '^\s*host\s+all\s+all\s+127\.0\.0\.1/32\s+scram-sha-256' "$PG_HBA_CONF"; then
     echo "host    all             all             127.0.0.1/32            scram-sha-256" >> "$PG_HBA_CONF"
   fi
@@ -229,30 +228,67 @@ PSQL
 }
 
 ########################################
-# 4) pgAdmin (local standalone, latest)
+# 4) pgAdmin (local, no Apache — venv + systemd)  ✅ FIXED
 ########################################
 install_pgadmin_local() {
-  log "Installing latest pgAdmin 4 (local standalone on 127.0.0.1:${PGADMIN_PORT})..."
-  curl -fsS https://www.pgadmin.org/static/packages_pgadmin_org.pub | gpg --dearmor -o /usr/share/keyrings/pgadmin-keyring.gpg
-  . /etc/os-release
-  echo "deb [signed-by=/usr/share/keyrings/pgadmin-keyring.gpg] https://ftp.postgresql.org/pub/pgadmin/pgadmin4/apt/${UBUNTU_CODENAME} pgadmin4 main" > /etc/apt/sources.list.d/pgadmin4.list
-  apt-get update -qq
-  apt-get install -y pgadmin4 -qq
+  log "Installing pgAdmin 4 (venv, local-only on 127.0.0.1:${PGADMIN_PORT})..."
 
-  mkdir -p /etc/pgadmin
-  cat >/etc/pgadmin/config_local.py <<EOF
+  # پاک‌سازی نصب‌های APT قبلی تا خطای setup-web.sh و سرویس جعلی نگیریم
+  apt-get -y purge pgadmin4 pgadmin4-web || true
+  rm -f /etc/apt/sources.list.d/pgadmin4.list || true
+
+  # پیش‌نیازها
+  apt-get update -qq
+  apt-get install -y python3-venv python3-pip -qq
+
+  # venv و نصب آخرین pgadmin4
+  install -d -m 0755 /opt/pgadmin
+  python3 -m venv /opt/pgadmin/venv
+  /opt/pgadmin/venv/bin/pip install --upgrade pip wheel >/dev/null
+  /opt/pgadmin/venv/bin/pip install --no-cache-dir pgadmin4 >/dev/null
+
+  # کانفیگ محلی (port/bind و سیاست‌های امنیتی)
+  install -d -m 0755 /opt/pgadmin/data
+  cat >/opt/pgadmin/config_local.py <<EOF
+SERVER_MODE = True
 DEFAULT_SERVER = '127.0.0.1'
 DEFAULT_SERVER_PORT = ${PGADMIN_PORT}
 SESSION_COOKIE_SECURE = True
 CSRF_COOKIE_SECURE = True
 ENHANCED_COOKIE_PROTECTION = True
+SQLITE_PATH = '/opt/pgadmin/data/pgadmin4.db'
+STORAGE_DIR = '/opt/pgadmin/data/storage'
+EOF
+  chown -R root:root /opt/pgadmin
+  chmod -R 700 /opt/pgadmin/data
+
+  # systemd unit
+  cat >/etc/systemd/system/pgadmin4.service <<EOF
+[Unit]
+Description=pgAdmin 4 (venv) Web UI
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+Environment=PGADMIN_LISTEN_ADDRESS=127.0.0.1
+Environment=PGADMIN_LISTEN_PORT=${PGADMIN_PORT}
+Environment=PYTHONPATH=/opt/pgadmin
+Environment=PGADMIN_CONFIG_LOCAL=/opt/pgadmin/config_local.py
+WorkingDirectory=/opt/pgadmin
+ExecStart=/opt/pgadmin/venv/bin/python -m pgadmin4
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
 EOF
 
-  if [[ -x /usr/pgadmin4/bin/setup-web.sh ]]; then
-    /usr/pgadmin4/bin/setup-web.sh --yes --mode server || true
-  fi
-  systemctl enable --now pgadmin4 || systemctl restart pgadmin4
-  ok "pgAdmin is listening on 127.0.0.1:${PGADMIN_PORT}"
+  systemctl daemon-reload
+  systemctl enable --now pgadmin4
+
+  ok "pgAdmin is listening on 127.0.0.1:${PGADMIN_PORT} (systemd: pgadmin4.service)"
+  echo "یادداشت: در اولین ورود به UI، اکانت ادمین را با ایمیل ${PGADMIN_EMAIL} خودت می‌سازی."
 }
 
 ########################################
@@ -419,9 +455,9 @@ print_summary() {
   - Metadata DB → ${MB_DB_NAME} (owner: ${MB_DB_USER})
   - اتصال به Postgres از طریق pg-gateway (بدون اکسپوز 5432) روی پورت هاست ${POSTGRES_PORT}
 
-- pgAdmin (لوکال، پشت NPM منتشر کن)
+- pgAdmin (لوکال بدون Apache)
   - Bind: 127.0.0.1:${PGADMIN_PORT}
-  - First login: از UI یک اکانت با ایمیل/پسوردی که دادی بساز
+  - نکته: در اولین ورود به UI، اکانت ادمین را با ایمیل ${PGADMIN_EMAIL} بساز.
 
 - code-server (لوکال)
   - URL:  http://127.0.0.1:${CODE_SERVER_PORT}
@@ -460,7 +496,7 @@ main() {
   ensure_hostname_mapping
   install_python_selected
   install_postgresql_local
-  install_pgadmin_local
+  install_pgadmin_local   # ← venv + systemd (بدون setup-web.sh)
   install_codeserver_local
   install_docker
   configure_ufw
