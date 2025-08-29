@@ -95,7 +95,7 @@ install_basics() {
 }
 
 ensure_hostname_mapping() {
-  # جلوگیری از خطای sudo: unable to resolve host <hostname>
+  # جلوگیری از خطای: sudo: unable to resolve host <hostname>
   local hn; hn="$(hostname)"
   if ! grep -Eq "127\.0\.1\.1\s+.*\b${hn}\b" /etc/hosts; then
     log "Fixing /etc/hosts mapping for hostname: $hn"
@@ -111,7 +111,7 @@ install_python_selected() {
   log "Installing Python ${PY_VERSION}..."
   case "$PY_VERSION" in
     3.10)
-      # کاملاً سازگار با Ubuntu 22.04 (پک‌های سیستمی)
+      # پایدارترین با Ubuntu 22.04 (سیستمی)
       apt-get install -y python3 python3-venv python3-dev python3-distutils python3-pip -qq
       update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3 1 || true
       update-alternatives --install /usr/bin/pip3 pip3 /usr/bin/pip3 1 || true
@@ -152,13 +152,13 @@ install_postgresql_local() {
   apt-get update -qq
   apt-get install -y postgresql postgresql-contrib -qq
 
-  # تشخیص نسخهٔ ماژور
+  # Detect major
   local PG_MAJ=""
   if command -v pg_lsclusters >/dev/null 2>&1; then
     PG_MAJ="$(pg_lsclusters -h | awk 'NR==1{print $1}')"
   fi
   if [[ -z "${PG_MAJ:-}" ]]; then
-    local PG_VER_STR; PG_VER_STR="$(psql -V | awk '{print $3}')"
+    local PG_VER_STR; PG_VER_STR="$(psql -V | awk '{print $3}')" # e.g. 17.6
     PG_MAJ="${PG_VER_STR%%.*}"
   fi
   [[ -z "$PG_MAJ" ]] && PG_MAJ="17"
@@ -168,21 +168,26 @@ install_postgresql_local() {
   local PG_HBA_CONF="${CONF_DIR}/pg_hba.conf"
   [[ -d "$CONF_DIR" ]] || { err "Config dir not found: $CONF_DIR"; command -v pg_lsclusters >/dev/null 2>&1 && pg_lsclusters || true; exit 1; }
 
-  # محدود به لوکال + پورت
-  grep -qE '^\s*listen_addresses' "$POSTGRESQL_CONF" \
-    && sed -i "s/^#\?listen_addresses.*/listen_addresses = '127.0.0.1'/" "$POSTGRESQL_CONF" \
-    || echo "listen_addresses = '127.0.0.1'" >> "$POSTGRESQL_CONF"
+  # Bind to localhost & set port (append if missing)
+  if grep -qE '^\s*#?\s*listen_addresses' "$POSTGRESQL_CONF"; then
+    sed -i "s/^#\?listen_addresses.*/listen_addresses = '127.0.0.1'/" "$POSTGRESQL_CONF"
+  else
+    echo "listen_addresses = '127.0.0.1'" >> "$POSTGRESQL_CONF"
+  fi
+  if grep -qE '^\s*#?\s*port\s*=' "$POSTGRESQL_CONF"; then
+    sed -i "s/^#\?port.*/port = ${POSTGRES_PORT}/" "$POSTGRESQL_CONF"
+  else
+    echo "port = ${POSTGRES_PORT}" >> "$POSTGRESQL_CONF"
+  fi
 
-  grep -qE '^\s*port\s*=' "$POSTGRESQL_CONF" \
-    && sed -i "s/^#\?port.*/port = ${POSTGRES_PORT}/" "$POSTGRESQL_CONF" \
-    || echo "port = ${POSTGRES_PORT}" >> "$POSTGRESQL_CONF"
-
-  grep -qE '^\s*host\s+all\s+all\s+127\.0\.0\.1/32\s+md5' "$PG_HBA_CONF" || \
+  # Ensure local md5 rule
+  if ! grep -qE '^\s*host\s+all\s+all\s+127\.0\.0\.1/32\s+md5' "$PG_HBA_CONF"; then
     echo "host    all             all             127.0.0.1/32            md5" >> "$PG_HBA_CONF"
+  fi
 
   systemctl enable --now postgresql
 
-  # ساخت امن رول و دیتابیس‌ها با heredoc quote‌شده (از expand شِل جلوگیری می‌کند)
+  # ساخت امن رول و دیتابیس‌ها با heredoc quote‌شده (جلوگیری از expand شِل روی $$)
   sudo -H -u postgres bash -lc \
 "psql -v ON_ERROR_STOP=1 --set=usr='${POSTGRES_USER}' --set=pw='${POSTGRES_PASSWORD}' --set=db='${POSTGRES_DB}' --set=mbusr='${MB_DB_USER}' --set=mbdb='${MB_DB_NAME}' <<'PSQL'
 DO $$ BEGIN
