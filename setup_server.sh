@@ -52,7 +52,7 @@ gather_inputs() {
   # Python version selector (default 3.10)
   PY_VERSION=$(prompt_value "نسخه Python (3.10 پایدار، یا 3.11/3.12/3.13)" "3.10")
 
-  # PostgreSQL (local)
+  # PostgreSQL (local, version 17)
   POSTGRES_PORT=$(prompt_value "پورت PostgreSQL (لوکال)" "5432")
   POSTGRES_USER=$(prompt_value "نام کاربری PostgreSQL" "postgres")
   POSTGRES_PASSWORD=$(prompt_secret "پسورد PostgreSQL")
@@ -67,9 +67,9 @@ gather_inputs() {
   PGADMIN_PORT=$(prompt_value "پورت pgAdmin (لوکال)" "5050")
   PGADMIN_EMAIL=$(prompt_value "ایمیل ادمین pgAdmin (اولین ورود را خودت می‌سازی)" "admin@example.com")
 
-  # code-server (local)
-  CODE_SERVER_PORT=$(prompt_value "پورت code-server (لوکال)" "8443")
-  CODE_SERVER_PASSWORD=$(prompt_secret "پسورد ورود code-server")
+  # code-server (public)
+  CODE_SERVER_PORT=$(prompt_value "پورت code-server (اینترنتی)" "8443")
+  CODE_SERVER_PASSWORD=$(prompt_secret "پسورد ورود code-server (روی نت)")
 
   echo; echo "✅ ورودی‌ها دریافت شد."
 }
@@ -84,7 +84,7 @@ update_upgrade() {
   apt-get -y dist-upgrade -qq
   apt-get -y autoremove -qq
   timedatectl set-timezone "$TIMEZONE" || true
-  ok "System updated. (پیام‌های NEEDRESTART-* فقط اطلاع‌رسانی هستند)"
+  ok "System updated."
 }
 
 install_basics() {
@@ -94,7 +94,6 @@ install_basics() {
 }
 
 ensure_hostname_mapping() {
-  # فیکس: sudo: unable to resolve host <hostname>
   local hn; hn="$(hostname)"
   if ! grep -Eq "127\.0\.1\.1\s+.*\b${hn}\b" /etc/hosts; then
     log "Fixing /etc/hosts mapping for hostname: $hn"
@@ -128,43 +127,32 @@ install_python_selected() {
         apt-get install -y python3-pip -qq || true
       fi
       ;;
-    *)
-      err "نسخه Python نامعتبر است. 3.10/3.11/3.12/3.13"
-      exit 1
-      ;;
+    *) err "نسخه Python نامعتبر است. 3.10/3.11/3.12/3.13"; exit 1 ;;
   esac
   ok "Python ${PY_VERSION} ready."
 }
 
 ########################################
-# 3) PostgreSQL (PGDG latest major, local-only) — \gexec + scram
+# 3) PostgreSQL 17 (PGDG only, local-only) — \gexec + scram
 ########################################
 install_postgresql_local() {
-  log "Adding official PostgreSQL (PGDG) repo & installing latest major..."
+  log "Adding official PostgreSQL (PGDG) repo & installing v17 only..."
   install -m 0755 -d /usr/share/keyrings
   curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /usr/share/keyrings/postgresql-keyring.gpg
   . /etc/os-release
   echo "deb [signed-by=/usr/share/keyrings/postgresql-keyring.gpg] http://apt.postgresql.org/pub/repos/apt ${UBUNTU_CODENAME}-pgdg main" > /etc/apt/sources.list.d/pgdg.list
   apt-get update -qq
-  apt-get install -y postgresql postgresql-contrib -qq
+  # جلوگیری از ساخت خودکار کلاستر و پین روی نسخه 17
+  sed -i 's/^#\?create_main_cluster.*/create_main_cluster = false/' /etc/postgresql-common/createcluster.conf || true
+  apt-get install -y postgresql-17 postgresql-client-17 postgresql-contrib-17 -qq
 
-  # Detect major
-  local PG_MAJ=""
-  if command -v pg_lsclusters >/dev/null 2>&1; then
-    PG_MAJ="$(pg_lsclusters -h | awk 'NR==1{print $1}')"
-  fi
-  if [[ -z "${PG_MAJ:-}" ]]; then
-    local PG_VER_STR; PG_VER_STR="$(psql -V | awk '{print $3}')"
-    PG_MAJ="${PG_VER_STR%%.*}"
-  fi
-  [[ -z "$PG_MAJ" ]] && PG_MAJ="17"
-
-  local CONF_DIR="/etc/postgresql/${PG_MAJ}/main"
+  # ساخت کلاستر main با تنظیمات دلخواه
+  pg_createcluster 17 main -- --auth-local=peer --auth-host=scram-sha-256
+  local CONF_DIR="/etc/postgresql/17/main"
   local POSTGRESQL_CONF="${CONF_DIR}/postgresql.conf"
   local PG_HBA_CONF="${CONF_DIR}/pg_hba.conf"
-  [[ -d "$CONF_DIR" ]] || { err "Config dir not found: $CONF_DIR"; command -v pg_lsclusters >/dev/null 2>&1 && pg_lsclusters || true; exit 1; }
 
-  # Bind to localhost & set port
+  # Bind و Port
   if grep -qE '^\s*#?\s*listen_addresses' "$POSTGRESQL_CONF"; then
     sed -i "s/^#\?listen_addresses.*/listen_addresses = '127.0.0.1'/" "$POSTGRESQL_CONF"
   else
@@ -176,78 +164,52 @@ install_postgresql_local() {
     echo "port = ${POSTGRES_PORT}" >> "$POSTGRESQL_CONF"
   fi
 
-  # Local scram-sha-256 (امن‌تر از md5)
+  # اطمینان از scram برای لوکال
   if ! grep -qE '^\s*host\s+all\s+all\s+127\.0\.0\.1/32\s+scram-sha-256' "$PG_HBA_CONF"; then
     echo "host    all             all             127.0.0.1/32            scram-sha-256" >> "$PG_HBA_CONF"
   fi
 
   systemctl enable --now postgresql
 
-  # Create roles & DBs safely using \gexec (NO DO $$, NO variable/$$ issues)
-  (
-    cd /var/lib/postgresql || cd /
-    sudo -H -u postgres psql --set=ON_ERROR_STOP=1 \
-      --set=usr="${POSTGRES_USER}" \
-      --set=pw="${POSTGRES_PASSWORD}" \
-      --set=db="${POSTGRES_DB}" \
-      --set=mbusr="${MB_DB_USER}" \
-      --set=mbpw="${MB_DB_PASSWORD}" \
-      --set=mbdb="${MB_DB_NAME}" \
-      --file - <<'PSQL'
--- App role
+  # ساخت role/db با \gexec (ایمن)
+  sudo -H -u postgres psql --set=ON_ERROR_STOP=1 \
+    --set=usr="${POSTGRES_USER}" \
+    --set=pw="${POSTGRES_PASSWORD}" \
+    --set=db="${POSTGRES_DB}" \
+    --set=mbusr="${MB_DB_USER}" \
+    --set=mbpw="${MB_DB_PASSWORD}" \
+    --set=mbdb="${MB_DB_NAME}" \
+    --file - <<'PSQL'
 SELECT format('CREATE ROLE %I LOGIN PASSWORD %L', :'usr', :'pw')
 WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'usr') \gexec
-
--- App DB
 SELECT format('CREATE DATABASE %I OWNER %I', :'db', :'usr')
 WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'db') \gexec
-
--- Metabase role
 SELECT format('CREATE ROLE %I LOGIN PASSWORD %L', :'mbusr', :'mbpw')
 WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'mbusr') \gexec
-
--- Metabase DB
 SELECT format('CREATE DATABASE %I OWNER %I', :'mbdb', :'mbusr')
 WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'mbdb') \gexec
 PSQL
-  )
 
-  # Optional cleanup: purge older majors if present
-  if command -v pg_lsclusters >/dev/null 2>&1; then
-    while read -r v rest; do
-      if [[ "$v" != "$PG_MAJ" ]]; then
-        log "Removing older PostgreSQL major: $v"
-        pg_dropcluster --stop "$v" main || true
-        apt-get -y purge "postgresql-$v" "postgresql-contrib-$v" || true
-      fi
-    done < <(pg_lsclusters -h | awk '{print $1" "$0}')
-  fi
-
-  systemctl restart postgresql
-  ok "PostgreSQL (PGDG $PG_MAJ) bound to 127.0.0.1:${POSTGRES_PORT} (conf: $CONF_DIR)."
+  ok "PostgreSQL 17 bound to 127.0.0.1:${POSTGRES_PORT} (conf: $CONF_DIR)."
 }
 
 ########################################
-# 4) pgAdmin (local, no Apache — venv + systemd)  ✅ FIXED
+# 4) pgAdmin (local, venv + gunicorn + systemd)
 ########################################
 install_pgadmin_local() {
-  log "Installing pgAdmin 4 (venv, local-only on 127.0.0.1:${PGADMIN_PORT})..."
+  log "Installing pgAdmin 4 (venv, gunicorn) on 127.0.0.1:${PGADMIN_PORT} ..."
 
-  # پاک‌سازی نصب‌های APT قبلی تا خطای setup-web.sh و سرویس جعلی نگیریم
   apt-get -y purge pgadmin4 pgadmin4-web || true
   rm -f /etc/apt/sources.list.d/pgadmin4.list || true
 
-  # پیش‌نیازها
   apt-get update -qq
-  apt-get install -y python3-venv python3-pip -qq
+  apt-get install -y python3-venv python3-pip libpq5 libldap-2.5-0 libsasl2-2 libssl3 libffi8 -qq
 
-  # venv و نصب آخرین pgadmin4
   install -d -m 0755 /opt/pgadmin
   python3 -m venv /opt/pgadmin/venv
   /opt/pgadmin/venv/bin/pip install --upgrade pip wheel >/dev/null
-  /opt/pgadmin/venv/bin/pip install --no-cache-dir pgadmin4 >/dev/null
+  /opt/pgadmin/venv/bin/pip install --no-cache-dir pgadmin4 gunicorn >/dev/null
 
-  # کانفیگ محلی (port/bind و سیاست‌های امنیتی)
   install -d -m 0755 /opt/pgadmin/data
   cat >/opt/pgadmin/config_local.py <<EOF
 SERVER_MODE = True
@@ -262,46 +224,40 @@ EOF
   chown -R root:root /opt/pgadmin
   chmod -R 700 /opt/pgadmin/data
 
-  # systemd unit
   cat >/etc/systemd/system/pgadmin4.service <<EOF
 [Unit]
-Description=pgAdmin 4 (venv) Web UI
+Description=pgAdmin 4 (gunicorn)
 After=network.target
-
 [Service]
 Type=simple
 User=root
 Group=root
-Environment=PGADMIN_LISTEN_ADDRESS=127.0.0.1
-Environment=PGADMIN_LISTEN_PORT=${PGADMIN_PORT}
 Environment=PYTHONPATH=/opt/pgadmin
 Environment=PGADMIN_CONFIG_LOCAL=/opt/pgadmin/config_local.py
 WorkingDirectory=/opt/pgadmin
-ExecStart=/opt/pgadmin/venv/bin/python -m pgadmin4
+ExecStart=/opt/pgadmin/venv/bin/gunicorn --workers 2 --threads 4 --bind 127.0.0.1:${PGADMIN_PORT} pgadmin4.pgAdmin4:app
 Restart=on-failure
-
 [Install]
 WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
   systemctl enable --now pgadmin4
-
-  ok "pgAdmin is listening on 127.0.0.1:${PGADMIN_PORT} (systemd: pgadmin4.service)"
-  echo "یادداشت: در اولین ورود به UI، اکانت ادمین را با ایمیل ${PGADMIN_EMAIL} خودت می‌سازی."
+  ok "pgAdmin running on 127.0.0.1:${PGADMIN_PORT}"
 }
 
 ########################################
-# 5) code-server (local/root, latest)
+# 5) code-server (PUBLIC, root, latest)
 ########################################
 install_codeserver_local() {
-  log "Installing latest code-server (root, local-only)..."
+  log "Installing latest code-server (root, PUBLIC access)..."
   curl -fsSL https://code-server.dev/install.sh | sh
+  umask 077
   mkdir -p /root/.config/code-server
   cat > /root/.config/code-server/config.yaml <<EOF
-bind-addr: 127.0.0.1:${CODE_SERVER_PORT}
+bind-addr: 0.0.0.0:${CODE_SERVER_PORT}
 auth: password
-password: ${CODE_SERVER_PASSWORD}
+password: "${CODE_SERVER_PASSWORD}"
 cert: false
 EOF
   cat > /etc/systemd/system/code-server.service <<EOF
@@ -311,21 +267,21 @@ After=network.target
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/bin/code-server --bind-addr 127.0.0.1:${CODE_SERVER_PORT} --auth password
+ExecStart=/usr/bin/code-server --bind-addr 0.0.0.0:${CODE_SERVER_PORT} --auth password
 Restart=on-failure
 [Install]
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
   systemctl enable --now code-server
-  ok "code-server running on 127.0.0.1:${CODE_SERVER_PORT}"
+  ok "code-server listening on 0.0.0.0:${CODE_SERVER_PORT} (PUBLIC)"
 }
 
 ########################################
 # 6) Docker & Compose (latest)
 ########################################
 install_docker() {
-  log "Installing Docker Engine & Compose (latest stable)..."
+  log "Installing Docker Engine & Compose..."
   install -m 0755 -d /etc/apt/keyrings
   curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
   chmod a+r /etc/apt/keyrings/docker.gpg
@@ -338,7 +294,7 @@ install_docker() {
 }
 
 ########################################
-# 7) UFW (SSH/Web only)
+# 7) UFW (SSH/Web + code-server public)
 ########################################
 configure_ufw() {
   log "Configuring UFW..."
@@ -350,7 +306,8 @@ configure_ufw() {
   ufw allow 443/tcp
   ufw allow 81/tcp     # NPM Admin
   ufw allow 9443/tcp   # Portainer
-  # 5432/5050/8443 لوکال هستند
+  ufw allow ${CODE_SERVER_PORT}/tcp  # code-server PUBLIC
+  # 5432/5050 لوکال هستند
   ufw --force enable
   ok "UFW configured."
 }
@@ -372,7 +329,6 @@ EOF
   cat > /opt/stack/docker-compose.yml <<'YAML'
 name: webstack
 services:
-  # Gateway از کانتینرها به Postgres لوکال روی هاست (بدون اکسپوز 5432 به اینترنت)
   pg-gateway:
     image: alpine/socat:latest
     command: ["tcp-listen:5432,fork,reuseaddr","tcp-connect:host.docker.internal:${PG_PORT}"]
@@ -394,7 +350,6 @@ services:
       TZ: ${TIMEZONE}
     depends_on: [ pg-gateway ]
     networks: [ backend ]
-    # از طریق NPM منتشر کنید (Proxy Host → metabase.yourdomain.com → Forward: metabase:3000)
 
   npm:
     image: jc21/nginx-proxy-manager:latest
@@ -407,6 +362,8 @@ services:
       - ./npm/data:/data
       - ./npm/letsencrypt:/etc/letsencrypt
     networks: [ backend ]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
   portainer:
     image: portainer/portainer-ce:latest
@@ -441,12 +398,11 @@ print_summary() {
   local SUM="
 ==================== خلاصهٔ نصب ====================
 [عمومی/وب]
-- Nginx Proxy Manager (Admin):  http://YOUR_SERVER_IP:81  (دامنه/SSL را از اینجا تنظیم کن)
+- Nginx Proxy Manager (Admin):  http://YOUR_SERVER_IP:81
 - Portainer:                    https://YOUR_SERVER_IP:9443
 
-[لوکال]
-- Python: ${PY_VERSION}
-- PostgreSQL (PGDG): 127.0.0.1:${POSTGRES_PORT}
+[لوکال/دیتابیس]
+- PostgreSQL 17: 127.0.0.1:${POSTGRES_PORT}
   - User: ${POSTGRES_USER}
   - Password: ${POSTGRES_PASSWORD}
   - Default DB: ${POSTGRES_DB}
@@ -455,29 +411,37 @@ print_summary() {
   - Metadata DB → ${MB_DB_NAME} (owner: ${MB_DB_USER})
   - اتصال به Postgres از طریق pg-gateway (بدون اکسپوز 5432) روی پورت هاست ${POSTGRES_PORT}
 
-- pgAdmin (لوکال بدون Apache)
+- pgAdmin (لوکال، gunicorn)
   - Bind: 127.0.0.1:${PGADMIN_PORT}
-  - نکته: در اولین ورود به UI، اکانت ادمین را با ایمیل ${PGADMIN_EMAIL} بساز.
+  - اولین ورود: با ایمیل ${PGADMIN_EMAIL} خودت اکانت بساز.
 
-- code-server (لوکال)
-  - URL:  http://127.0.0.1:${CODE_SERVER_PORT}
+[IDE]
+- code-server (PUBLIC)
+  - URL:  http://YOUR_SERVER_IP:${CODE_SERVER_PORT}
   - Password: ${CODE_SERVER_PASSWORD}
+  - User: root
 
 [Firewall/UFW]
-- باز: 22(SSH), 80, 81, 443, 9443
-- بسته: 5432 (Postgres), ${PGADMIN_PORT} (pgAdmin), ${CODE_SERVER_PORT} (code-server)
+- باز: 22(SSH), 80, 81, 443, 9443, ${CODE_SERVER_PORT}
+- بسته: 5432 (Postgres), ${PGADMIN_PORT} (pgAdmin)
 
-[گام‌های بعدی در NPM]
-- Proxy Host برای pgAdmin:
+[Proxy Host ها (در NPM)]
+- pgAdmin:
   - Domain: pgadmin.yourdomain.com
-  - Forward Host/IP: 127.0.0.1
+  - Forward Host/IP: host.docker.internal
   - Forward Port: ${PGADMIN_PORT}
   - SSL: Let’s Encrypt + Force SSL + HTTP/2
 
-- Proxy Host برای Metabase:
+- Metabase:
   - Domain: metabase.yourdomain.com
   - Forward Host/IP: metabase
   - Forward Port: 3000
+  - SSL: Let’s Encrypt + Force SSL + HTTP/2
+
+- code-server (اگر خواستی پشت NPM ببری):
+  - Domain: ide.yourdomain.com
+  - Forward Host/IP: host.docker.internal
+  - Forward Port: ${CODE_SERVER_PORT}
   - SSL: Let’s Encrypt + Force SSL + HTTP/2
 ===================================================
 "
@@ -496,7 +460,7 @@ main() {
   ensure_hostname_mapping
   install_python_selected
   install_postgresql_local
-  install_pgadmin_local   # ← venv + systemd (بدون setup-web.sh)
+  install_pgadmin_local
   install_codeserver_local
   install_docker
   configure_ufw
