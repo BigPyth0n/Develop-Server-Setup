@@ -1,157 +1,102 @@
 #!/usr/bin/env bash
-# =============================================================================
-#  setup_server.sh  —  Ubuntu 22.04
-#  Stack: Python 3.10, PostgreSQL 14 (public), code-server (public, root),
-#         Nginx Proxy Manager & Portainer via Docker, UFW
-#  Idempotent & hardened for previous errors
-# =============================================================================
 set -euo pipefail
 
-# ---------- Helpers ----------
-log()  { echo -e "\033[1;34m[INFO]\033[0m $*"; }
-ok()   { echo -e "\033[1;32m[DONE]\033[0m $*"; }
-warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
-err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
-trap 'err "اسکریپت در خط $LINENO با خطا متوقف شد (exit $?)."' ERR
-need_root(){ [[ $EUID -eq 0 ]] || { err "این اسکریپت باید با sudo/root اجرا شود."; exit 1; }; }
-prompt_value(){ local q="$1" def="${2-}" ans=""; if [[ -n "$def" ]]; then read -r -p "$q [$def]: " ans || true; ans="${ans:-$def}"; else read -r -p "$q: " ans || true; while [[ -z "$ans" ]]; do read -r -p "$q (خالی نباشد): " ans || true; done; fi; echo "$ans"; }
-prompt_secret(){ local q="$1" a1="" a2=""; while true; do read -r -s -p "$q (مخفی): " a1 || true; echo; [[ -n "$a1" ]] || { echo " - خالی نباشد."; continue; }; read -r -s -p "تکرار $q: " a2 || true; echo; if [[ "$a1" == "$a2" ]]; then echo "$a1"; return 0; else echo " - مطابقت ندارند؛ دوباره."; fi; done; }
-write_summary(){ local f="/root/setup_summary.txt"; umask 077; printf "%s\n" "$1" > "$f"; chmod 600 "$f"; echo "📄 خلاصه در: $f"; }
+########################################
+# Helpers
+########################################
+log() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
+ok()  { echo -e "\033[1;32m[DONE]\033[0m $*"; }
+err() { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
+need_root(){ [[ $EUID -eq 0 ]] || { err "Run as root (sudo)."; exit 1; }; }
 
-# ---------- 0) Inputs ----------
+########################################
+# Inputs
+########################################
 gather_inputs() {
-  echo "=== پیکربندی تعاملی ==="
-  TIMEZONE=$(prompt_value "Timezone" "Etc/UTC")
-  CODE_SERVER_PORT="8443"
-  POSTGRES_PORT="5432"
-  POSTGRES_PASSWORD=$(prompt_secret "پسورد کاربر postgres (برای اتصال از نت)")
-  CODE_SERVER_PASSWORD=$(prompt_secret "پسورد ورود به code-server (PUBLIC)")
-  ok "ورودی‌ها دریافت شد."
+  POSTGRES_PASSWORD="changeme_pg"
+  CODE_SERVER_PASSWORD="changeme_code"
+  PGADMIN_EMAIL="admin@example.com"
+  SERVER_IP=$(curl -s ifconfig.me || hostname -I | awk '{print $1}')
+  ok "Inputs set. (You can edit defaults in script if needed)"
 }
 
-# ---------- 1) System prep ----------
+########################################
+# System prep
+########################################
 prepare_system() {
-  log "System update/upgrade + base tools"
+  log "Updating system and installing base packages..."
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
   apt-get -y dist-upgrade -qq
-  apt-get -y autoremove -qq
-  timedatectl set-timezone "$TIMEZONE" || true
-  apt-get install -y apt-transport-https ca-certificates curl gnupg unzip zip git nano tmux ufw software-properties-common lsb-release -qq
-  local hn; hn="$(hostname)"; grep -q "127.0.1.1.*${hn}" /etc/hosts || echo "127.0.1.1 ${hn} ${hn%%.*}" >> /etc/hosts
+  apt-get install -y tmux nano zip unzip curl git ufw apt-transport-https ca-certificates gnupg lsb-release -qq
   ok "System ready."
 }
 
-# ---------- 2) Python 3.10 ----------
-install_python_310() {
-  log "Installing Python 3.10"
+########################################
+# Python 3.10
+########################################
+install_python() {
+  log "Installing Python 3.10..."
   apt-get install -y python3.10 python3.10-venv python3.10-dev python3-pip -qq
   update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1
-  python3 -m pip -q install --upgrade pip
-  ok "Python 3.10 installed and set default."
+  update-alternatives --install /usr/bin/pip3 pip3 /usr/bin/pip3 1
+  ok "Python 3.10 installed."
 }
 
-# ---------- 3) PostgreSQL 14 (public: 0.0.0.0, SCRAM, no DB creation) ----------
-install_postgresql14() {
-  log "Installing PostgreSQL 14 (Ubuntu repo)"
-  apt-get update -qq
-  apt-get install -y postgresql postgresql-contrib postgresql-client -qq
+########################################
+# PostgreSQL 14
+########################################
+install_postgres() {
+  log "Installing PostgreSQL 14..."
+  apt-get install -y postgresql-14 postgresql-client-14 postgresql-contrib -qq
 
-  # Detect cluster dir (usually 14/main)
-  local PG_MAJ="14"
-  command -v pg_lsclusters >/dev/null 2>&1 && PG_MAJ="$(pg_lsclusters -h | awk 'NR==1{print $1}')" || true
-  [[ -z "$PG_MAJ" ]] && PG_MAJ="14"
-  local CONF_DIR="/etc/postgresql/${PG_MAJ}/main"
-  local PG_CONF="${CONF_DIR}/postgresql.conf"
-  local PG_HBA="${CONF_DIR}/pg_hba.conf"
-  [[ -d "$CONF_DIR" ]] || { err "Config dir not found: $CONF_DIR"; exit 1; }
+  PG_CONF="/etc/postgresql/14/main/postgresql.conf"
+  PG_HBA="/etc/postgresql/14/main/pg_hba.conf"
 
-  # Bind & port
-  grep -qE '^\s*#?\s*listen_addresses' "$PG_CONF" \
-    && sed -i "s/^#\?listen_addresses.*/listen_addresses = '0.0.0.0'/" "$PG_CONF" \
-    || echo "listen_addresses = '0.0.0.0'" >> "$PG_CONF"
+  sed -i "s/^#\?listen_addresses.*/listen_addresses = '*'/" "$PG_CONF"
+  sed -i "s/^#\?port.*/port = 5432/" "$PG_CONF"
+  echo "host all all 0.0.0.0/0 scram-sha-256" >> "$PG_HBA"
 
-  grep -qE '^\s*#?\s*port\s*=' "$PG_CONF" \
-    && sed -i "s/^#\?port.*/port = ${POSTGRES_PORT}/" "$PG_CONF" \
-    || echo "port = ${POSTGRES_PORT}" >> "$PG_CONF"
+  systemctl enable --now postgresql
 
-  # SCRAM
-  grep -qE '^\s*#?\s*password_encryption' "$PG_CONF" \
-    && sed -i "s/^#\?password_encryption.*/password_encryption = 'scram-sha-256'/" "$PG_CONF" \
-    || echo "password_encryption = 'scram-sha-256'" >> "$PG_CONF"
+  PW_ESC=${POSTGRES_PASSWORD//\'/\'\'}
+  sudo -u postgres psql -v ON_ERROR_STOP=1 -c "ALTER ROLE postgres WITH PASSWORD '${PW_ESC}';"
 
-  # Allow all (per request) with SCRAM
-  if ! grep -qE '^\s*host\s+all\s+all\s+0\.0\.0\.0/0\s+scram-sha-256' "$PG_HBA"; then
-    echo "host    all             all             0.0.0.0/0            scram-sha-256" >> "$PG_HBA"
-  fi
-
-  systemctl enable postgresql >/dev/null 2>&1 || true
-  systemctl restart postgresql || true
-  command -v pg_ctlcluster >/dev/null 2>&1 && pg_ctlcluster "$PG_MAJ" main start || true
-
-  # Set password for postgres (no DO block, no \gexec; avoids earlier errors)
-  ( cd /var/lib/postgresql && sudo -H -u postgres psql -v ON_ERROR_STOP=1 -v pw="${POSTGRES_PASSWORD}" \
-      -c "ALTER ROLE postgres PASSWORD :'pw';" )
-
-  ok "PostgreSQL ${PG_MAJ} listening on 0.0.0.0:${POSTGRES_PORT} (SCRAM, postgres password set)."
+  ok "PostgreSQL 14 ready and accessible on 0.0.0.0:5432"
 }
 
-# ---------- 4) code-server (PUBLIC, root, port 8443) ----------
+########################################
+# code-server
+########################################
 install_codeserver() {
-  log "Installing code-server (PUBLIC) on 0.0.0.0:8443"
+  log "Installing code-server..."
   curl -fsSL https://code-server.dev/install.sh | sh
-  umask 077
   mkdir -p /root/.config/code-server
   cat > /root/.config/code-server/config.yaml <<EOF
-bind-addr: 0.0.0.0:${CODE_SERVER_PORT}
+bind-addr: 0.0.0.0:8443
 auth: password
 password: "${CODE_SERVER_PASSWORD}"
 cert: false
 EOF
-
-  # Explicit systemd unit as root
-  cat > /etc/systemd/system/code-server.service <<EOF
-[Unit]
-Description=code-server (root)
-After=network.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/root
-ExecStart=/usr/bin/code-server
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  systemctl daemon-reload
   systemctl enable --now code-server
-  systemctl restart code-server
-  ok "code-server is up at 0.0.0.0:${CODE_SERVER_PORT}"
+  ok "code-server running on :8443"
 }
 
-# ---------- 5) Docker & Compose ----------
-install_docker() {
-  log "Installing Docker & Compose plugin"
+########################################
+# Docker + NPM + Portainer
+########################################
+install_docker_stack() {
+  log "Installing Docker & Compose..."
   install -m 0755 -d /etc/apt/keyrings
   curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-  chmod a+r /etc/apt/keyrings/docker.gpg
   echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
   apt-get update -qq
-  apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin -qq
+  apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin -qq
   systemctl enable --now docker
-  ok "Docker ready."
-}
 
-# ---------- 6) Docker stack: NPM + Portainer ----------
-setup_docker_stack() {
-  log "Writing docker-compose stack (NPM + Portainer)"
-  mkdir -p /opt/stack/npm /opt/stack/portainer
+  mkdir -p /opt/stack
   cat > /opt/stack/docker-compose.yml <<'YAML'
 version: "3.8"
-
 services:
   npm:
     image: jc21/nginx-proxy-manager:latest
@@ -161,8 +106,8 @@ services:
       - "81:81"
       - "443:443"
     volumes:
-      - ./npm/data:/data
-      - ./npm/letsencrypt:/etc/letsencrypt
+      - ./npm-data:/data
+      - ./letsencrypt:/etc/letsencrypt
 
   portainer:
     image: portainer/portainer-ce:latest
@@ -171,88 +116,78 @@ services:
       - "9443:9443"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./portainer/data:/data
+      - ./portainer-data:/data
 YAML
 
-  ( cd /opt/stack && docker compose pull && docker compose up -d )
-  ok "NPM (80/81/443) & Portainer (9443) are up."
+  cd /opt/stack
+  docker compose up -d
+  ok "NPM and Portainer running."
 }
 
-# ---------- 7) UFW firewall ----------
+########################################
+# Firewall
+########################################
 configure_ufw() {
-  log "Configuring UFW (public ports)"
+  log "Configuring firewall..."
   ufw --force reset
   ufw default deny incoming
   ufw default allow outgoing
-  ufw allow OpenSSH || ufw allow 22/tcp
+  ufw allow 22/tcp
   ufw allow 80/tcp
   ufw allow 81/tcp
   ufw allow 443/tcp
   ufw allow 9443/tcp
-  ufw allow ${CODE_SERVER_PORT}/tcp
-  ufw allow ${POSTGRES_PORT}/tcp
+  ufw allow 8443/tcp
+  ufw allow 5432/tcp
   ufw --force enable
-  ok "UFW enabled."
+  ok "Firewall configured."
 }
 
-# ---------- 8) Sanity checks + Summary ----------
-sanity_and_summary() {
-  local ip; ip="$(curl -s ifconfig.me || hostname -I | awk '{print $1}' || echo 'YOUR_SERVER_IP')"
-
-  echo -e "\n==== LISTEN PORTS ===="
-  ss -ltnp | egrep "(:80|:81|:443|:9443|:${CODE_SERVER_PORT}|:${POSTGRES_PORT})\b" || true
-
-  echo -e "\n==== LOCAL CURL TESTS ===="
-  for u in "http://127.0.0.1:81" "http://127.0.0.1:80" "https://127.0.0.1:9443" "http://127.0.0.1:${CODE_SERVER_PORT}"; do
-    echo -n "$u -> "; curl -skI --max-time 5 "$u" | head -n1 || echo "FAIL"
-  done
-
-  echo -e "\n==== DOCKER COMPOSE PS ===="
-  (cd /opt/stack && docker compose ps) || true
-
-  local SUMMARY="
-==================== خلاصهٔ نصب ====================
-[آدرس‌های دسترسی (با IP فعلی سرور)]
-- Nginx Proxy Manager (Admin):  http://${ip}:81/
-  • کرِدِنشیال پیش‌فرض:  admin@example.com  /  changeme
-- Portainer:                    https://${ip}:9443/
-  • اولین ورود: ساخت کاربر ادمین توسط خودت در UI
-- code-server (root):           http://${ip}:${CODE_SERVER_PORT}/
-  • User: root
-  • Password: ${CODE_SERVER_PASSWORD}
+########################################
+# Summary
+########################################
+print_summary() {
+  echo -e "
+================= نصب کامل شد =================
+IP سرور شما: ${SERVER_IP}
 
 [PostgreSQL 14]
-- Bind Address: 0.0.0.0
-- Port:         ${POSTGRES_PORT}
-- Default Superuser: postgres
-- Password:     (همانی که وارد کردی)
-- احراز هویت شبکه:  SCRAM برای 0.0.0.0/0  (کاملاً پابلیک — با مسئولیت خودت)
+- آدرس: postgresql://postgres:${POSTGRES_PASSWORD}@${SERVER_IP}:5432/postgres
+- کاربر: postgres
+- پورت: 5432
 
-[برنامه‌های عمومی نصب‌شده]
-- tmux, nano, zip, unzip, curl, git, gnupg, ca-certificates, software-properties-common, lsb-release, ufw
-- Python 3.10  (python3 / pip3)
+[code-server]
+- URL: http://${SERVER_IP}:8443/
+- کاربر: root
+- پسورد: ${CODE_SERVER_PASSWORD}
 
-[Firewall/UFW]
-- Open: 22 (SSH), 80 (HTTP), 81 (NPM Admin), 443 (HTTPS), 9443 (Portainer), ${CODE_SERVER_PORT} (code-server), ${POSTGRES_PORT} (PostgreSQL)
-===================================================
-"
-  echo "$SUMMARY"
-  write_summary "$SUMMARY"
+[Nginx Proxy Manager]
+- URL: http://${SERVER_IP}:81/
+- پیش‌فرض: admin@example.com / changeme
+
+[Portainer]
+- URL: https://${SERVER_IP}:9443/
+
+[ابزارها]
+- نصب شده: tmux, nano, zip, unzip, curl, git, python3.10, pip3
+
+فایل خلاصه: /root/setup_summary.txt
+================================================
+" | tee /root/setup_summary.txt
 }
 
-# ---------- MAIN ----------
+########################################
+# MAIN
+########################################
 main() {
   need_root
   gather_inputs
   prepare_system
-  install_python_310
-  install_postgresql14
+  install_python
+  install_postgres
   install_codeserver
-  install_docker
-  setup_docker_stack
+  install_docker_stack
   configure_ufw
-  sanity_and_summary
-  ok "تمام شد."
+  print_summary
 }
-
 main "$@"
