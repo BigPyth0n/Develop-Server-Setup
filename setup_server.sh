@@ -4,6 +4,7 @@
 #  Stack: Python (selectable), PostgreSQL 14 (Ubuntu default), pgAdmin (venv),
 #         code-server (PUBLIC), NPM/Portainer/Metabase (Docker), UFW
 #  Idempotent: safe to re-run
+#  Programming BigPyth0n & Elisa Ver 10.0.0
 # =============================================================================
 set -euo pipefail
 
