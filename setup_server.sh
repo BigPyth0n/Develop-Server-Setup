@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  اسم:   setup_server.sh
-#  هدف:   راه‌اندازی سریع سرور توسعه/دیتا با Postgres 17، pgAdmin (لوکال)،
-#         code-server (پابلیک)، NPM/Portainer/Metabase (Docker)، و فایروال UFW.
-#  وضعیت: Idempotent (قابل اجرای مجدد بدون خطا)
-#  نویسنده: Alyssa (الیسا)
+#  setup_server.sh  —  Ubuntu 22.04 LTS
+#  Stack: Python (selectable), PostgreSQL 14 (Ubuntu default), pgAdmin (venv),
+#         code-server (PUBLIC), NPM/Portainer/Metabase (Docker), UFW
+#  Idempotent: safe to re-run
 # =============================================================================
 set -euo pipefail
 
@@ -15,40 +14,12 @@ log()  { echo -e "\033[1;34m[INFO]\033[0m $*"; }
 ok()   { echo -e "\033[1;32m[DONE]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
 err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
-
 trap 'err "اسکریپت در خط $LINENO با خطا متوقف شد (exit $?)."' ERR
+need_root(){ [[ $EUID -eq 0 ]] || { err "باید با sudo/root اجرا شود."; exit 1; }; }
 
-need_root(){ [[ $EUID -eq 0 ]] || { err "این اسکریپت باید با sudo/root اجرا شود."; exit 1; }; }
-
-prompt_value() { # $1=question  $2=default
-  local q="$1" def="${2-}" ans=""
-  if [[ -n "$def" ]]; then
-    read -r -p "$q [$def]: " ans || true
-    ans="${ans:-$def}"
-  else
-    read -r -p "$q: " ans || true
-    while [[ -z "$ans" ]]; do read -r -p "$q (خالی نباشد): " ans || true; done
-  fi
-  echo "$ans"
-}
-
-prompt_secret() { # $1=question
-  local q="$1" a1="" a2=""
-  while true; do
-    read -r -s -p "$q (مخفی): " a1 || true; echo
-    [[ -n "$a1" ]] || { echo " - خالی نباشد."; continue; }
-    read -r -s -p "تکرار $q: " a2 || true; echo
-    if [[ "$a1" == "$a2" ]]; then echo "$a1"; return 0; else echo " - مطابقت ندارند؛ دوباره."; fi
-  done
-}
-
-write_summary(){ # $1=text
-  local f="/root/setup_summary.txt"
-  umask 077
-  printf "%s\n" "$1" > "$f"
-  chmod 600 "$f"
-  echo "📄 خلاصه در: $f"
-}
+prompt_value() { local q="$1" def="${2-}" ans=""; if [[ -n "$def" ]]; then read -r -p "$q [$def]: " ans || true; ans="${ans:-$def}"; else read -r -p "$q: " ans || true; while [[ -z "$ans" ]]; do read -r -p "$q (خالی نباشد): " ans || true; done; fi; echo "$ans"; }
+prompt_secret(){ local q="$1" a1="" a2=""; while true; do read -r -s -p "$q (مخفی): " a1 || true; echo; [[ -n "$a1" ]] || { echo " - خالی نباشد."; continue; }; read -r -s -p "تکرار $q: " a2 || true; echo; if [[ "$a1" == "$a2" ]]; then echo "$a1"; return 0; else echo " - مطابقت ندارند؛ دوباره."; fi; done; }
+write_summary(){ local f="/root/setup_summary.txt"; umask 077; printf "%s\n" "$1" > "$f"; chmod 600 "$f"; echo "📄 خلاصه در: $f"; }
 
 ########################################
 # 0) Interactive inputs
@@ -58,7 +29,6 @@ gather_inputs() {
   TIMEZONE=$(prompt_value "Timezone" "Etc/UTC")
   PY_VERSION=$(prompt_value "نسخه Python (3.10/3.11/3.12/3.13)" "3.10")
 
-  # PostgreSQL remote?
   WANT_REMOTE=$(prompt_value "به Postgres از بیرون نیاز داری؟ (yes/no)" "no")
   if [[ "$WANT_REMOTE" == "yes" ]]; then
     POSTGRES_BIND_ADDRESS="0.0.0.0"
@@ -72,16 +42,13 @@ gather_inputs() {
   POSTGRES_PASSWORD=$(prompt_secret "پسورد PostgreSQL")
   POSTGRES_DB=$(prompt_value "نام دیتابیس اولیه" "appdb")
 
-  # Metabase metadata (on local Postgres)
   MB_DB_NAME=$(prompt_value "نام دیتابیس متابیس" "metabase")
   MB_DB_USER=$(prompt_value "یوزر متابیس" "metabase")
   MB_DB_PASSWORD=$(prompt_secret "پسورد متابیس")
 
-  # pgAdmin (local)
   PGADMIN_PORT=$(prompt_value "پورت pgAdmin (لوکال)" "5050")
   PGADMIN_EMAIL=$(prompt_value "ایمیل ادمین pgAdmin (ساخت در اولین ورود)" "admin@example.com")
 
-  # code-server (PUBLIC)
   CODE_SERVER_PORT=$(prompt_value "پورت code-server (پابلیک)" "8443")
   CODE_SERVER_PASSWORD=$(prompt_secret "پسورد code-server")
 
@@ -99,9 +66,7 @@ prepare_system() {
   apt-get -y autoremove -qq
   timedatectl set-timezone "$TIMEZONE" || true
   apt-get install -y apt-transport-https ca-certificates curl gnupg unzip git nano zip ufw software-properties-common lsb-release -qq
-  # hostname fix (sudo resolve)
-  local hn; hn="$(hostname)"
-  grep -q "127.0.1.1.*${hn}" /etc/hosts || echo "127.0.1.1 ${hn} ${hn%%.*}" >> /etc/hosts
+  local hn; hn="$(hostname)"; grep -q "127.0.1.1.*${hn}" /etc/hosts || echo "127.0.1.1 ${hn} ${hn%%.*}" >> /etc/hosts
   ok "System ready."
 }
 
@@ -129,33 +94,28 @@ install_python_selected() {
 }
 
 ########################################
-# 3) PostgreSQL 17 (PGDG, idempotent)
+# 3) PostgreSQL 14 (Ubuntu default, idempotent)
 ########################################
 install_postgresql_host() {
-  log "Installing PostgreSQL 17 (PGDG, idempotent)"
-  install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /etc/apt/keyrings/postgresql-keyring.gpg
-  echo "deb [signed-by=/etc/apt/keyrings/postgresql-keyring.gpg] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list
+  log "Installing PostgreSQL 14 from Ubuntu repo (no PGDG)"
+  # بستهٔ متا «postgresql» روی Jammy → نسخهٔ 14 را نصب می‌کند
   apt-get update -qq
+  apt-get install -y postgresql postgresql-contrib postgresql-client -qq
 
-  # مهم: اول postgresql-common، بعد غیرفعالسازی ساخت خودکار کلاستر
-  apt-get install -y postgresql-common -qq
-  sed -i 's/^#\?create_main_cluster.*/create_main_cluster = false/' /etc/postgresql-common/createcluster.conf || true
-
-  apt-get install -y postgresql-17 postgresql-client-17 -qq
-
-  # ساخت کلاستر فقط اگر نبود
-  if pg_lsclusters 2>/dev/null | awk '{print $1,$2}' | grep -q "^17 main$"; then
-    log "Cluster 17/main وجود دارد؛ از ساخت صرف‌نظر می‌کنیم."
-  else
-    log "Creating cluster 17/main ..."
-    pg_createcluster 17 main -- --auth-local=peer --auth-host=scram-sha-256
+  # تشخیص نسخهٔ اصلی نصب‌شده (باید 14 باشد؛ ولی داینامیک تشخیص می‌دهیم)
+  local PG_MAJ
+  if command -v pg_lsclusters >/dev/null 2>&1; then
+    PG_MAJ="$(pg_lsclusters -h | awk 'NR==1{print $1}')"
   fi
+  PG_MAJ="${PG_MAJ:-14}"
 
-  local PG_CONF="/etc/postgresql/17/main/postgresql.conf"
-  local PG_HBA="/etc/postgresql/17/main/pg_hba.conf"
+  local CONF_DIR="/etc/postgresql/${PG_MAJ}/main"
+  local PG_CONF="${CONF_DIR}/postgresql.conf"
+  local PG_HBA="${CONF_DIR}/pg_hba.conf"
 
-  # Bind/Port
+  [[ -d "$CONF_DIR" ]] || { err "پوشهٔ کانفیگ Postgres یافت نشد: $CONF_DIR"; exit 1; }
+
+  # Bind/Port (idempotent)
   grep -qE '^\s*#?\s*listen_addresses' "$PG_CONF" \
     && sed -i "s/^#\?listen_addresses.*/listen_addresses = '${POSTGRES_BIND_ADDRESS}'/" "$PG_CONF" \
     || echo "listen_addresses = '${POSTGRES_BIND_ADDRESS}'" >> "$PG_CONF"
@@ -164,7 +124,7 @@ install_postgresql_host() {
     && sed -i "s/^#\?port.*/port = ${POSTGRES_PORT}/" "$PG_CONF" \
     || echo "port = ${POSTGRES_PORT}" >> "$PG_CONF"
 
-  # pg_hba: scram لوکال و در صورت نیاز ریموت
+  # احراز هویت امن برای لوکال و در صورت نیاز ریموت (scram-sha-256)
   grep -qE '^\s*host\s+all\s+all\s+127\.0\.0\.1/32\s+scram-sha-256' "$PG_HBA" \
     || echo "host    all             all             127.0.0.1/32            scram-sha-256" >> "$PG_HBA"
 
@@ -173,32 +133,52 @@ install_postgresql_host() {
       || echo "host    all             all             ${POSTGRES_REMOTE_IP}/32     scram-sha-256" >> "$PG_HBA"
   fi
 
-  systemctl enable postgresql
-  systemctl restart postgresql
+  systemctl enable postgresql >/dev/null 2>&1 || true
+  systemctl restart postgresql || true
 
-  # Roles & DBs (idempotent via \gexec)
-  sudo -H -u postgres psql --set=ON_ERROR_STOP=1 \
-    --set=usr="${POSTGRES_USER}" \
-    --set=pw="${POSTGRES_PASSWORD}" \
-    --set=db="${POSTGRES_DB}" \
-    --set=mbusr="${MB_DB_USER}" \
-    --set=mbpw="${MB_DB_PASSWORD}" \
-    --set=mbdb="${MB_DB_NAME}" \
-    --file - <<'PSQL'
-SELECT format('CREATE ROLE %I LOGIN PASSWORD %L', :'usr', :'pw')
-WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'usr') \gexec;
+  # اطمینان از بالا بودن کلاستر قبل از psql
+  if command -v pg_ctlcluster >/dev/null 2>&1; then
+    pg_ctlcluster "$PG_MAJ" main start || true
+  fi
 
-SELECT format('CREATE DATABASE %I OWNER %I', :'db', :'usr')
-WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'db') \gexec;
+  # ساخت role/db — بدون \gexec ؛ idempotent با DO-block
+  sudo -H -u postgres psql --set=ON_ERROR_STOP=1 <<PSQL
+DO \$\$
+BEGIN
+  -- App role
+  BEGIN
+    EXECUTE format('CREATE ROLE %I LOGIN PASSWORD %L', '${POSTGRES_USER}', '${POSTGRES_PASSWORD}');
+  EXCEPTION WHEN duplicate_object THEN NULL;
+  END;
 
-SELECT format('CREATE ROLE %I LOGIN PASSWORD %L', :'mbusr', :'mbpw')
-WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'mbusr') \gexec;
+  -- App DB
+  BEGIN
+    PERFORM 1 FROM pg_database WHERE datname='${POSTGRES_DB}';
+    IF NOT FOUND THEN
+      EXECUTE format('CREATE DATABASE %I OWNER %I', '${POSTGRES_DB}', '${POSTGRES_USER}');
+    END IF;
+  EXCEPTION WHEN duplicate_database THEN NULL;
+  END;
 
-SELECT format('CREATE DATABASE %I OWNER %I', :'mbdb', :'mbusr')
-WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'mbdb') \gexec;
+  -- Metabase role
+  BEGIN
+    EXECUTE format('CREATE ROLE %I LOGIN PASSWORD %L', '${MB_DB_USER}', '${MB_DB_PASSWORD}');
+  EXCEPTION WHEN duplicate_object THEN NULL;
+  END;
+
+  -- Metabase DB
+  BEGIN
+    PERFORM 1 FROM pg_database WHERE datname='${MB_DB_NAME}';
+    IF NOT FOUND THEN
+      EXECUTE format('CREATE DATABASE %I OWNER %I', '${MB_DB_NAME}', '${MB_DB_USER}');
+    END IF;
+  EXCEPTION WHEN duplicate_database THEN NULL;
+  END;
+END
+\$\$;
 PSQL
 
-  ok "PostgreSQL 17 روی ${POSTGRES_BIND_ADDRESS}:${POSTGRES_PORT} آماده است."
+  ok "PostgreSQL ${PG_MAJ} روی ${POSTGRES_BIND_ADDRESS}:${POSTGRES_PORT} آماده است."
 }
 
 ########################################
@@ -207,14 +187,10 @@ PSQL
 install_pgadmin_host() {
   log "Installing pgAdmin 4 (venv+gunicorn) on 127.0.0.1:${PGADMIN_PORT}"
   apt-get install -y python3-venv python3-pip libpq5 libldap-2.5-0 libsasl2-2 libssl3 libffi8 -qq
-
   install -d -m 0755 /opt/pgadmin
-  if [[ ! -d /opt/pgadmin/venv ]]; then
-    python3 -m venv /opt/pgadmin/venv
-  fi
+  [[ -d /opt/pgadmin/venv ]] || python3 -m venv /opt/pgadmin/venv
   /opt/pgadmin/venv/bin/pip -q install --upgrade pip wheel
   /opt/pgadmin/venv/bin/pip -q install --no-cache-dir pgadmin4 gunicorn
-
   install -d -m 0755 /opt/pgadmin/data
   cat >/opt/pgadmin/config_local.py <<EOF
 SERVER_MODE = True
@@ -226,7 +202,6 @@ ENHANCED_COOKIE_PROTECTION = True
 SQLITE_PATH = '/opt/pgadmin/data/pgadmin4.db'
 STORAGE_DIR = '/opt/pgadmin/data/storage'
 EOF
-
   cat >/etc/systemd/system/pgadmin4.service <<EOF
 [Unit]
 Description=pgAdmin 4 (gunicorn)
@@ -243,7 +218,6 @@ Restart=on-failure
 [Install]
 WantedBy=multi-user.target
 EOF
-
   systemctl daemon-reload
   systemctl enable --now pgadmin4
   ok "pgAdmin روی 127.0.0.1:${PGADMIN_PORT} اجراست."
@@ -390,19 +364,13 @@ sanity_checks_and_summary() {
   echo -e "\n==== DOCKER COMPOSE PS ===="
   (cd /opt/stack && docker compose ps) || true
 
-  # Summary (با نمایش کامل یوزرنیم/پسورد طبق خواست)
-  local REMOTE_NOTE=""
-  if [[ -n "${POSTGRES_REMOTE_IP}" ]]; then
-    REMOTE_NOTE="(باز برای ${POSTGRES_REMOTE_IP})"
-  else
-    REMOTE_NOTE="(فقط لوکال)"
-  fi
+  local REMOTE_NOTE="(فقط لوکال)"; [[ -n "${POSTGRES_REMOTE_IP}" ]] && REMOTE_NOTE="(باز برای ${POSTGRES_REMOTE_IP})"
 
   local SUMMARY="
 ==================== خلاصهٔ نصب ====================
 [عمومی]
 - NPM (Admin):        http://${ip}:81
-  * Default login (اولین ورود): admin@example.com / changeme
+  * Default login: admin@example.com / changeme
 - Portainer:          https://${ip}:9443
 - code-server (root): http://${ip}:${CODE_SERVER_PORT}
   * Password: ${CODE_SERVER_PASSWORD}
@@ -411,7 +379,7 @@ sanity_checks_and_summary() {
 - pgAdmin:            http://127.0.0.1:${PGADMIN_PORT}
   * First admin email: ${PGADMIN_EMAIL}
 
-[PostgreSQL 17]
+[PostgreSQL 14]
 - Bind: ${POSTGRES_BIND_ADDRESS}:${POSTGRES_PORT} ${REMOTE_NOTE}
 - User: ${POSTGRES_USER}
 - Pass: ${POSTGRES_PASSWORD}
@@ -424,11 +392,6 @@ sanity_checks_and_summary() {
 [Firewall/UFW]
 - Open: 22,80,81,443,9443,${CODE_SERVER_PORT} $( [[ -n "$POSTGRES_REMOTE_IP" ]] && echo ", ${POSTGRES_PORT} فقط برای ${POSTGRES_REMOTE_IP}" )
 - Closed: 5432 به‌جز برای IP مجاز (اگر تعریف شده)
-
-[راهنمای NPM]
-- pgAdmin → Domain: pgadmin.yourdomain → Forward host: host.docker.internal → Port: ${PGADMIN_PORT} → SSL
-- code-server → Domain: ide.yourdomain → Forward host: host.docker.internal → Port: ${CODE_SERVER_PORT} → SSL
-- Metabase → Domain: metabase.yourdomain → Forward host: metabase → Port: 3000 → SSL
 ===================================================
 "
   echo "$SUMMARY"
@@ -443,7 +406,7 @@ main() {
   gather_inputs
   prepare_system
   install_python_selected
-  install_postgresql_host
+  install_postgresql_host       # ← حالا PostgreSQL 14 پایدار
   install_pgadmin_host
   install_codeserver_host
   install_docker
