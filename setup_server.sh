@@ -26,6 +26,7 @@ write_summary(){ local f="/root/setup_summary.txt"; umask 077; printf "%s\n" "$1
 # 0) Interactive inputs
 ########################################
 gather_inputs() {
+  echo "=== خوش اومدید به ورژن 10.0.0  ==="
   echo "=== پیکربندی تعاملی ==="
   TIMEZONE=$(prompt_value "Timezone" "Etc/UTC")
   PY_VERSION=$(prompt_value "نسخه Python (3.10/3.11/3.12/3.13)" "3.10")
